@@ -3,6 +3,7 @@ module github.com/jima/gcal
 go 1.23.4
 
 require (
+	github.com/google/go-cmp v0.7.0
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/oauth2 v0.24.0
 	google.golang.org/api v0.214.0

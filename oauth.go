@@ -1,3 +1,4 @@
+// Package gcal provides OAuth2 authentication and token management for Google Calendar API access.
 package gcal
 
 import (
@@ -7,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -148,6 +150,9 @@ func SaveToken(token *oauth2.Token) error {
 
 // RunAuthFlow performs the OAuth browser flow and saves the token
 func RunAuthFlow(creds *Credentials, port int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
 	if port <= 0 {
 		port = DefaultCallbackPort
 	}
@@ -163,8 +168,9 @@ func RunAuthFlow(creds *Credentials, port int) error {
 		return fmt.Errorf("start callback server: %w", err)
 	}
 
-	server := &http.Server{}
-	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+	// Use a new mux to avoid global handler registration
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			errChan <- fmt.Errorf("no code in callback")
@@ -176,8 +182,12 @@ func RunAuthFlow(creds *Credentials, port int) error {
 		fmt.Fprintf(w, `<html><body><h1>Authorization successful!</h1><p>You can close this tab and return to the terminal.</p></body></html>`)
 	})
 
+	server := &http.Server{
+		Handler: mux,
+	}
+
 	go func() {
-		if err := server.Serve(listener); err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			errChan <- err
 		}
 	}()
@@ -196,17 +206,22 @@ func RunAuthFlow(creds *Credentials, port int) error {
 	case code = <-codeChan:
 		// Success
 	case err := <-errChan:
-		server.Close()
+		server.Shutdown(ctx)
 		return err
-	case <-time.After(5 * time.Minute):
-		server.Close()
+	case <-ctx.Done():
+		server.Shutdown(ctx)
 		return fmt.Errorf("authorization timeout - no response received")
 	}
 
-	server.Close()
+	// Gracefully shutdown server
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		// Log but don't fail - we already have the code
+		fmt.Fprintf(os.Stderr, "warning: failed to shutdown server gracefully: %v\n", err)
+	}
 
 	// Exchange code for token
-	ctx := context.Background()
 	token, err := config.Exchange(ctx, code)
 	if err != nil {
 		return fmt.Errorf("exchange code: %w", err)
@@ -223,19 +238,39 @@ func RunAuthFlow(creds *Credentials, port int) error {
 
 // openBrowser opens URL in default browser
 func openBrowser(url string) {
-	// Use xdg-open on Linux
-	cmd := "xdg-open"
-	args := []string{url}
-
 	// Fire and forget
 	go func() {
-		proc := &os.ProcAttr{
-			Files: []*os.File{nil, nil, nil},
+		var cmd string
+		var args []string
+
+		// Determine command based on OS
+		// Check for Windows first
+		if os.Getenv("OS") == "Windows_NT" || os.Getenv("COMSPEC") != "" {
+			cmd = "cmd"
+			args = []string{"/c", "start", url}
+		} else {
+			// Try to detect macOS vs Linux
+			// macOS typically has "open" command
+			if path, err := exec.LookPath("open"); err == nil && path != "" {
+				cmd = "open"
+				args = []string{url}
+			} else {
+				// Default to xdg-open for Linux
+				cmd = "xdg-open"
+				args = []string{url}
+			}
 		}
-		p, err := os.StartProcess("/usr/bin/xdg-open", append([]string{cmd}, args...), proc)
-		if err == nil {
-			p.Release()
+
+		// Try to find the command in PATH
+		path, err := exec.LookPath(cmd)
+		if err != nil {
+			// Silently fail if we can't find the command
+			return
 		}
+
+		// Use exec.Command for better cross-platform support
+		cmdObj := exec.Command(path, args...)
+		cmdObj.Start() // Fire and forget - don't wait
 	}()
 }
 

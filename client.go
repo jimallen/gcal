@@ -1,7 +1,9 @@
+// Package gcal provides a Google Calendar CLI client for fetching and managing calendar events.
 package gcal
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -9,6 +11,12 @@ import (
 
 	"google.golang.org/api/calendar/v3"
 	"google.golang.org/api/option"
+)
+
+// Event status constants
+const (
+	eventStatusCancelled   = "cancelled"
+	responseStatusAccepted = "accepted"
 )
 
 // Meeting URL patterns
@@ -42,6 +50,7 @@ func FetchTodayEvents(ctx context.Context, calendarIDs []string) Response {
 	endOfDay := startOfDay.Add(24 * time.Hour)
 
 	var allEvents []Event
+	var errors []string
 
 	for _, calID := range calendarIDs {
 		events, err := srv.Events.List(calID).
@@ -52,20 +61,29 @@ func FetchTodayEvents(ctx context.Context, calendarIDs []string) Response {
 			Do()
 
 		if err != nil {
-			// Continue with other calendars if one fails
+			// Collect errors but continue with other calendars
+			errors = append(errors, fmt.Sprintf("calendar %s: %v", calID, err))
 			continue
 		}
 
-		for _, item := range events.Items {
-			event := convertEvent(item)
-			if event != nil {
-				allEvents = append(allEvents, *event)
+		if events.Items != nil {
+			for _, item := range events.Items {
+				event := convertEvent(item)
+				if event != nil {
+					allEvents = append(allEvents, *event)
+				}
 			}
 		}
 	}
 
-	// Sort by start time
-	sort.Slice(allEvents, func(i, j int) bool {
+	// Log errors if any occurred (but don't fail if we got some events)
+	if len(errors) > 0 && len(allEvents) == 0 {
+		// If we got no events and had errors, return an error response
+		return NewErrorResponse(ErrAPIError, fmt.Sprintf("failed to fetch events: %s", strings.Join(errors, "; ")))
+	}
+
+	// Sort by start time (stable sort to preserve order of events with same start time)
+	sort.SliceStable(allEvents, func(i, j int) bool {
 		return allEvents[i].Start < allEvents[j].Start
 	})
 
@@ -95,6 +113,7 @@ func FetchUpcomingEvents(ctx context.Context, calendarIDs []string, hours int) R
 	endTime := now.Add(time.Duration(hours) * time.Hour)
 
 	var allEvents []Event
+	var errors []string
 
 	for _, calID := range calendarIDs {
 		events, err := srv.Events.List(calID).
@@ -105,18 +124,28 @@ func FetchUpcomingEvents(ctx context.Context, calendarIDs []string, hours int) R
 			Do()
 
 		if err != nil {
+			// Collect errors but continue with other calendars
+			errors = append(errors, fmt.Sprintf("calendar %s: %v", calID, err))
 			continue
 		}
 
-		for _, item := range events.Items {
-			event := convertEvent(item)
-			if event != nil {
-				allEvents = append(allEvents, *event)
+		if events.Items != nil {
+			for _, item := range events.Items {
+				event := convertEvent(item)
+				if event != nil {
+					allEvents = append(allEvents, *event)
+				}
 			}
 		}
 	}
 
-	sort.Slice(allEvents, func(i, j int) bool {
+	// Log errors if any occurred (but don't fail if we got some events)
+	if len(errors) > 0 && len(allEvents) == 0 {
+		// If we got no events and had errors, return an error response
+		return NewErrorResponse(ErrAPIError, fmt.Sprintf("failed to fetch events: %s", strings.Join(errors, "; ")))
+	}
+
+	sort.SliceStable(allEvents, func(i, j int) bool {
 		return allEvents[i].Start < allEvents[j].Start
 	})
 
@@ -169,10 +198,12 @@ func ListCalendars(ctx context.Context) CalendarsResponse {
 	}
 }
 
-// convertEvent converts a Google Calendar event to our Event type
+// convertEvent converts a Google Calendar event to our Event type.
+// It filters out cancelled events, all-day events, events without attendees,
+// and events not accepted by the user.
 func convertEvent(item *calendar.Event) *Event {
 	// Skip cancelled events
-	if item.Status == "cancelled" {
+	if item.Status == eventStatusCancelled {
 		return nil
 	}
 
@@ -189,13 +220,15 @@ func convertEvent(item *calendar.Event) *Event {
 	}
 
 	// Extract attendees
-	for _, attendee := range item.Attendees {
-		if attendee.Self {
-			event.ResponseStatus = attendee.ResponseStatus
-		} else if attendee.Email != "" {
-			event.Attendees = append(event.Attendees, attendee.DisplayName)
-			if event.Attendees[len(event.Attendees)-1] == "" {
-				event.Attendees[len(event.Attendees)-1] = attendee.Email
+	if item.Attendees != nil {
+		for _, attendee := range item.Attendees {
+			if attendee.Self {
+				event.ResponseStatus = attendee.ResponseStatus
+			} else if attendee.Email != "" {
+				event.Attendees = append(event.Attendees, attendee.DisplayName)
+				if event.Attendees[len(event.Attendees)-1] == "" {
+					event.Attendees[len(event.Attendees)-1] = attendee.Email
+				}
 			}
 		}
 	}
@@ -207,7 +240,7 @@ func convertEvent(item *calendar.Event) *Event {
 	}
 
 	// Skip events not accepted by user
-	if event.ResponseStatus != "accepted" {
+	if event.ResponseStatus != responseStatusAccepted {
 		return nil
 	}
 

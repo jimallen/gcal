@@ -1,3 +1,4 @@
+// Package gcal defines types and response structures for the Google Calendar CLI.
 package gcal
 
 import "time"
